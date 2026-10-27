@@ -30,6 +30,14 @@
     "LICENSE"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CurLeaf/dsh-sidebar-share.git"
+  },
+  "homepage": "https://github.com/CurLeaf/dsh-sidebar-share#readme",
+  "bugs": {
+    "url": "https://github.com/CurLeaf/dsh-sidebar-share/issues"
+  },
   "author": "qzsy",
   "keywords": [
     "dsh",
