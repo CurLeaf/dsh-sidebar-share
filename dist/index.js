@@ -17,7 +17,12 @@ export const name = 'sidebar-share'
 
 /** Persisted, editable preference served through the Host settings document. */
 export const Config = z.object({
-	scope: z.union(['workspace', 'session']).default('workspace').volatile(),
+	// NOTE: no `.volatile()` here. Volatile fields resolve to a reference object
+	// read with `.get()`; the browser half compares `snapshot.value.scope` to a
+	// plain string, so a volatile `scope` never equals 'session' and the setting
+	// silently stays on 'workspace'. Official DSH settings plugins read plain
+	// values the same way (`snapshot.value?.key`).
+	scope: z.union(['workspace', 'session']).default('workspace'),
 })
 
 /**

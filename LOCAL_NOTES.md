@@ -117,3 +117,38 @@ harness 覆盖：v1 → v2 迁移、reset 清空并收起、首个 tab 解除 re
 - 发布物 6 个文件 / 18.0 kB；从 registry 重新下载校验：`dist/index.js` 含 `Config` + `settings.configure`，`dist/client.js` 含 `plugins.bundle.config` / `setScopeMode`。
 - 本地 profile 仍 link 到本目录；**必须重启 DSH**（或插件页关/开一次）才会加载新的 Host 半，只 Cmd+R 只更新客户端。
 - 重启后确认：插件页 `dsh-sidebar-share` 出现「侧边栏范围」，默认 `workspace`，切 `session` 后不再跨会话镜像。
+
+## 2026-10-27 迁移到 Linux（/home/yxw/WorkSpace）
+
+- 仓库已接上 origin（`git@github.com:CurLeaf/dsh-sidebar-share.git`），HEAD `ee2753b`；
+  `web` profile 里仍是 `link:/home/yxw/WorkSpace/dsh-sidebar-share`，`dsh.profile.bundles` 含本插件。
+- macOS 时代的 schemastery 软链没有跟过来，宿主半一加载就
+  `ERR_MODULE_NOT_FOUND: Cannot find package '@deepseek-ai/schemastery'`，整个插件不生效。
+  这台机器改用「本地装一份」而非软链（同样不进 npm 包 `files` 白名单）：
+
+  ```bash
+  cd /home/yxw/WorkSpace/dsh-sidebar-share
+  npm install --no-save --no-package-lock @deepseek-ai/schemastery@3.18.5
+  ```
+
+  `3.18.5` 与 DSH 内置版本一致；改 `dist/index.js` 后可这样自检：
+
+  ```bash
+  node --input-type=module -e "import('/home/yxw/WorkSpace/dsh-sidebar-share/dist/index.js').then(m=>console.log(Object.keys(m)))"
+  # 期望输出 Config,apply,name
+  ```
+
+- release.sh / npm-token.sh 里写死的是 macOS Keychain 与 `/Users/curleaf/...` 路径，Linux 上发布前需要改。
+
+## 2026-10-27 修复：「侧边栏范围」切不到「会话独立」
+
+- 现象：插件页能选「会话独立」，但切完仍是工作区共享（`scopeMode` 永远 `workspace`）。
+- 根因：`Config` 里 `scope` 用了 `.volatile()`。schemastery 3.18.5 的 volatile 字段解析成
+  「稳定引用」（要 `.get()` 才拿到值），而浏览器半是 `snapshot.value.scope === 'session'` 直比字符串，
+  于是永远不相等。`JSON.stringify(Config({}))` 会显示成 `{"scope":{}}` 就是这个原因。
+- 顺带确认：这不是 union 写法的问题——`z.union(['workspace','session'])` 在 3.18.1 / 3.18.5
+  不带 `.volatile()` 时都正常（默认 `workspace`、传 `session` 保留、非法值被拒）。
+- 修法：去掉 `.volatile()`。用户偏好本来就该是普通持久化值，官方设置插件也是直接读
+  `snapshot.value?.key`，不用 `.get()`。
+- 自检：`Config({}) === {scope:'workspace'}`、`Config({scope:'session'}) === {scope:'session'}`、
+  `Config({scope:'bogus'})` 抛错。`node test/harness.mjs` 仍 ok。
