@@ -227,3 +227,12 @@ harness 覆盖：v1 → v2 迁移、reset 清空并收起、首个 tab 解除 re
 
 - 只改浏览器半（`dist/client.js`），刷新窗口即可；`PLUGIN_VERSION` 与 `package.json` 都升到 0.1.7。
 - 依赖的 `sidebarRight.closeIn` / `screen()` / `actionsFor()` 是 `ui-sidebar-right` 的控制器方法（不是 `ISidebarRight` 的公开面），DSH 升级后若改名，关闭会退回 store action；两者都没有时菜单项仍在、点击只弹 toast，不影响镜像。
+
+## 2026-11-01 00:05 发布结果（0.1.7）
+
+- `git push origin main`：`d1f589b..10a651b`，提交 `feat(tab-menu): close other tabs and tabs to the right`。
+- `bash scripts/release.sh` 输出 `+ dsh-sidebar-share@0.1.7`；`npm view dsh-sidebar-share dist-tags` → `{ "latest": "0.1.7" }`，`gitHead` = `10a651b`。
+- 从 registry 重新 `npm pack` 校验 tarball：`PLUGIN_VERSION = '0.1.7'`、含 `sidebar-share:close-others` / `sidebar-share:close-right`、「关闭其他标签页」/「关闭右侧标签页」文案、`closeIn(sessionId, tabId)` 优先路径。包体 6 files / 26.5 kB。
+- 附注：本机 `~/.npmrc` 的 token 已失效（`npm whoami` 401），本次发布走 Keychain 的 `npm-dsh-sidebar-share`；需要时可 `bash scripts/npm-token.sh` 刷新 `~/.npmrc`。
+- 已打 annotated tag `v0.1.7`（指向 10a651b）并推送。
+- 本机 desktop profile 是 `link:` 安装，刷新窗口即可用上 0.1.7；其它机器 `dsh plugin --profile desktop add dsh-sidebar-share`。
