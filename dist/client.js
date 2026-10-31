@@ -23,8 +23,12 @@
  * expanded/mode presentation. A workspace that is empty is always applied
  * closed, so "nothing open" never turns into an empty panel popping open.
  *
- * It also contributes two right-sidebar tab-menu entries:
+ * It also contributes four right-sidebar tab-menu entries:
  *
+ *   - 「关闭其他标签页」 and 「关闭右侧标签页」 close the clicked tab's siblings in
+ *     its own dock pane, right to left. They go through the sidebar controller's
+ *     `closeIn` so the tab kind's teardown still runs (a terminal's cleanup),
+ *     and they only appear when the pane actually has tabs to close.
  *   - A file tab offers to reveal itself in the Host's file manager
  *     (「在访达中显示」/「在文件资源管理器中显示」/「在文件管理器中显示」). The Host
  *     resolves the tab's verified absolute path and hands it to the same
@@ -36,7 +40,7 @@
  *     composer's `inputActions` face is mounted it inserts an undoable edit;
  *     otherwise it copies the reference to the clipboard and says so.
  *
- * Both entries work with only the `{ tab, dismiss }` props the tab-menu slot
+ * Every entry works with only the `{ tab, dismiss }` props the tab-menu slot
  * guarantees; every extra face (`inputActions`, `sessionId`, the Remote
  * namespaces) is read from services, so a host that stops passing one cannot
  * make an entry vanish.
@@ -55,7 +59,7 @@ window.__ModuleLoader__.load({
 			? dockkit.EMPTY_HISTORY
 			: { entries: [], cursor: 0 };
 
-		const PLUGIN_VERSION = '0.1.6';
+		const PLUGIN_VERSION = '0.1.7';
 		const TAG = '[sidebar-share]';
 		const CANONICAL_PREFIX = 'dsh.sidebar-share.v2.';
 		const LEGACY_PREFIX = 'dsh.sidebar-share.v1.';
@@ -779,6 +783,12 @@ window.__ModuleLoader__.load({
 		const BROWSER_PREFIX = 'dsh.sidebar-browser.v1.';
 		const MENU_STYLE_ID = 'dsh-sidebar-share/tab-menu.css';
 		const TOAST_CLASS = 'dsh-sidebar-share-toast';
+		const CLOSE_OTHERS_MENU_ID = 'sidebar-share:close-others';
+		const CLOSE_OTHERS_MENU_LABEL = '关闭其他标签页';
+		const CLOSE_OTHERS_MENU_ORDER = 60;
+		const CLOSE_RIGHT_MENU_ID = 'sidebar-share:close-right';
+		const CLOSE_RIGHT_MENU_LABEL = '关闭右侧标签页';
+		const CLOSE_RIGHT_MENU_ORDER = 70;
 		const CHAT_MENU_ID = 'sidebar-share:chat-reference';
 		const CHAT_MENU_LABEL = '引用到对话';
 		const REVEAL_MENU_ID = 'sidebar-share:reveal-in-file-manager';
@@ -1269,6 +1279,181 @@ window.__ModuleLoader__.load({
 					h('path', { d: 'M8.4 5.2 11.2 8l-2.8 2.8', strokeLinecap: 'round', strokeLinejoin: 'round' }),
 					h('path', { d: 'M12.6 3v10', strokeLinecap: 'round', opacity: 0.5 })));
 
+		/* --- Closing a tab's siblings --------------------------------------- */
+
+		/**
+		 * The dock pane that currently holds `tabId`, or undefined when the id is
+		 * stale. A pane is one tab strip, so "others" and "to the right" never
+		 * reach across a split or into a floating panel.
+		 */
+		const paneOfTab = (layout, tabId) => {
+			if (!isObject(layout) || !isObject(layout.nodes)) return undefined;
+			if (typeof tabId !== 'string' || tabId.length === 0) return undefined;
+			try {
+				for (const node of Object.values(layout.nodes)) {
+					if (!isObject(node) || node.kind !== 'pane' || !Array.isArray(node.tabs)) continue;
+					if (node.tabs.includes(tabId)) return node;
+				}
+			} catch {}
+			return undefined;
+		};
+
+		/** The Session whose sidebar owns this menu; the slot carries it, the factory knows it. */
+		const sidebarSessionOf = (props, ctx) => {
+			if (props && typeof props.sessionId === 'string' && props.sessionId.length > 0) return props.sessionId;
+			return onScreenSessionId(ctx);
+		};
+
+		/** The `sidebarRight` controller, or undefined when the Host has no sidebar. */
+		const sidebarController = (ctx) => {
+			try {
+				return ctx.get('sidebarRight') || undefined;
+			} catch {
+				return undefined;
+			}
+		};
+
+		/** The controller's own view of the sidebar it is showing. */
+		const screenSurface = (ctx) => {
+			try {
+				const right = sidebarController(ctx);
+				if (!right || typeof right.screen !== 'function') return undefined;
+				const screen = right.screen();
+				return isObject(screen) && isObject(screen.surface) ? screen : undefined;
+			} catch {
+				return undefined;
+			}
+		};
+
+		/**
+		 * One Session's dock layout: the controller first, the mirrored store
+		 * second. The controller only knows the Session on screen, while the store
+		 * keeps every Session this window has adopted — which is what a mirrored
+		 * sidebars menu needs.
+		 */
+		const sidebarLayoutFor = (ctx, sessionId) => {
+			const screen = screenSurface(ctx);
+			if (screen && isObject(screen.surface.layout)) {
+				if (typeof sessionId !== 'string' || screen.sessionId === sessionId) return screen.surface.layout;
+			}
+			try {
+				for (const group of groups.values()) {
+					const record = group.layoutInstances.get(sessionId);
+					if (!record || !record.instance || typeof record.instance.getSnapshot !== 'function') continue;
+					const snapshot = record.instance.getSnapshot();
+					const surface = isObject(snapshot) && isObject(snapshot.bySession) ? snapshot.bySession[sessionId] : undefined;
+					if (isObject(surface) && isObject(surface.layout)) return surface.layout;
+				}
+			} catch {}
+			return undefined;
+		};
+
+		/** The dock store's own actions; undefined for a Session this window never adopted. */
+		const sidebarActionsFor = (ctx, sessionId) => {
+			try {
+				const right = sidebarController(ctx);
+				if (right && typeof right.actionsFor === 'function') {
+					const actions = right.actionsFor(sessionId);
+					if (isObject(actions) && typeof actions.closeTab === 'function') return actions;
+				}
+			} catch {}
+			try {
+				for (const group of groups.values()) {
+					const record = group.layoutInstances.get(sessionId);
+					const actions = record && record.instance ? record.instance.actions : undefined;
+					if (isObject(actions) && typeof actions.closeTab === 'function') return actions;
+				}
+			} catch {}
+			return undefined;
+		};
+
+		/**
+		 * The tabs a close command would remove. 'others' keeps the menu's own tab;
+		 * 'right' keeps everything at or left of it, in tab-strip order.
+		 */
+		const closeTargetsFor = (layout, tabId, mode) => {
+			const pane = paneOfTab(layout, tabId);
+			if (!pane) return [];
+			const index = pane.tabs.indexOf(tabId);
+			if (index === -1) return [];
+			return mode === 'others'
+				? pane.tabs.filter((id) => id !== tabId)
+				: pane.tabs.slice(index + 1);
+		};
+
+		const closeTargets = (ctx, props, mode) => {
+			const tab = props ? props.tab : undefined;
+			return closeTargetsFor(sidebarLayoutFor(ctx, sidebarSessionOf(props, ctx)), tab && tab.id, mode);
+		};
+
+		/** Close right-to-left so the kit settles the focus on the leftmost survivor. */
+		const closeTabSiblings = (ctx, props, mode) => {
+			const sessionId = sidebarSessionOf(props, ctx);
+			const tab = props ? props.tab : undefined;
+			const targets = closeTargetsFor(sidebarLayoutFor(ctx, sessionId), tab && tab.id, mode);
+			if (targets.length === 0) return 0;
+			const right = sidebarController(ctx);
+			// `closeIn` also runs the tab kind's own teardown (a terminal's cleanup);
+			// the raw store action is the fallback for a Host that does not expose it.
+			const closeIn = right && typeof right.closeIn === 'function' ? right.closeIn.bind(right) : undefined;
+			const actions = closeIn ? undefined : sidebarActionsFor(ctx, sessionId);
+			if (!closeIn && !actions) {
+				showMenuToast('侧栏还没准备好，请稍后再试');
+				return 0;
+			}
+			let closed = 0;
+			for (let index = targets.length - 1; index >= 0; index -= 1) {
+				const tabId = targets[index];
+				try {
+					if (closeIn) closeIn(sessionId, tabId);
+					else actions.closeTab(sessionId, tabId);
+					closed += 1;
+				} catch (error) {
+					warn('close tab failed', tabId, error);
+				}
+			}
+			return closed;
+		};
+
+		const closeOthersIcon = (h) =>
+			h('span', { className: 'dsh-sidebar-share-menu-icon', 'aria-hidden': 'true' },
+				h('svg', { width: 14, height: 14, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4 },
+					h('path', { d: 'M2.6 4.2l4.4 4.4M7 4.2 2.6 8.6', strokeLinecap: 'round' }),
+					h('path', { d: 'M10.8 4.2h2.6M10.8 8h2.6M10.8 11.8h2.6', strokeLinecap: 'round', opacity: 0.55 })));
+
+		const closeRightIcon = (h) =>
+			h('span', { className: 'dsh-sidebar-share-menu-icon', 'aria-hidden': 'true' },
+				h('svg', { width: 14, height: 14, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4 },
+					h('path', { d: 'M1.8 4.8l4.2 4.2M6 4.8 1.8 9', strokeLinecap: 'round' }),
+					h('path', { d: 'M9.6 8h3.6', strokeLinecap: 'round' }),
+					h('path', { d: 'M11.4 6.2 13.2 8l-1.8 1.8', strokeLinecap: 'round', strokeLinejoin: 'round' })));
+
+		const createCloseMenuItem = (react, ctx, mode) => {
+			const h = react.createElement;
+			const label = mode === 'others' ? CLOSE_OTHERS_MENU_LABEL : CLOSE_RIGHT_MENU_LABEL;
+			const title = mode === 'others'
+				? '关闭同一分栏里除当前标签以外的所有标签页'
+				: '关闭同一分栏里排在当前标签右侧的所有标签页';
+			const icon = mode === 'others' ? closeOthersIcon : closeRightIcon;
+			const CloseItem = (props) => {
+				if (closeTargets(ctx, props, mode).length === 0) return null;
+				return h('button', {
+					type: 'button',
+					role: 'menuitem',
+					className: 'dsh-sidebar-share-menu-item',
+					title,
+					onClick: (event) => {
+						stopEvent(event);
+						const dismiss = props && typeof props.dismiss === 'function' ? props.dismiss : undefined;
+						if (dismiss) dismiss();
+						closeTabSiblings(ctx, props, mode);
+					},
+				}, icon(h), h('span', null, label));
+			};
+			CloseItem.displayName = mode === 'others' ? 'SidebarShareCloseOthersItem' : 'SidebarShareCloseRightItem';
+			return CloseItem;
+		};
+
 		const createRevealMenuItem = (react, ctx) => {
 			const h = react.createElement;
 			const RevealItem = (props) => {
@@ -1334,7 +1519,7 @@ window.__ModuleLoader__.load({
 			return ChatReferenceItem;
 		};
 
-		/** Both `sidebar.right.tab.menu.item` entries; silent when the slot is absent. */
+		/** The `sidebar.right.tab.menu.item` entries; silent when the slot is absent. */
 		const registerTabMenuItems = (slots, disposers, ctx) => {
 			if (!slots || typeof slots.inject !== 'function' || typeof slots.register !== 'function') return;
 			const react = requireReact();
@@ -1354,6 +1539,8 @@ window.__ModuleLoader__.load({
 					warn(failure + ' menu unavailable', error);
 				}
 			};
+			register(CLOSE_OTHERS_MENU_ID, CLOSE_OTHERS_MENU_ORDER, CLOSE_OTHERS_MENU_LABEL, createCloseMenuItem(react, ctx, 'others'), 'close others');
+			register(CLOSE_RIGHT_MENU_ID, CLOSE_RIGHT_MENU_ORDER, CLOSE_RIGHT_MENU_LABEL, createCloseMenuItem(react, ctx, 'right'), 'close right');
 			register(REVEAL_MENU_ID, REVEAL_MENU_ORDER, FILE_MANAGER_LABELS.finder, createRevealMenuItem(react, ctx), 'reveal');
 			register(CHAT_MENU_ID, CHAT_MENU_ORDER, CHAT_MENU_LABEL, createChatMenuItem(react, ctx), 'chat reference');
 		};
@@ -1718,6 +1905,8 @@ window.__ModuleLoader__.load({
 									resolvePath: (tab) => hostPathOfTab(ctx, tab),
 									reveal: (tab) => revealTabInFileManager(ctx, tab, fileManagerSnapshot() ?? 'directory'),
 									parseAddress: parseFileAddress,
+									closeTargets: (sessionId, tabId, mode) => closeTargetsFor(sidebarLayoutFor(ctx, sessionId), tabId, mode),
+									closeSiblings: (props, mode) => closeTabSiblings(ctx, props, mode),
 								},
 							};
 						} catch {}

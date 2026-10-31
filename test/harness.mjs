@@ -386,8 +386,45 @@ const remote = {
   },
 }
 const sidebarRightState = { mounted: 'session-a' }
+// The controller's own copy of the on-screen sidebar, plus the close action the
+// tab-menu entries reach through `actionsFor`.
+const closeCalls = []
+const closePath = []
+const menuTab = (id, file) => ({
+  id,
+  kind: 'text',
+  contentId: `dsh-resource://file/session/session-a/docs/${file}`,
+  title: file,
+})
+const menuLayout = {
+  nodes: { pane1: { kind: 'pane', id: 'pane1', host: 'dock', tabs: ['tabM1', 'tabM2', 'tabM3'], activeTabId: 'tabM3' } },
+  tabs: {
+    tabM1: menuTab('tabM1', 'one.md'),
+    tabM2: menuTab('tabM2', 'two.md'),
+    tabM3: menuTab('tabM3', 'three.md'),
+  },
+  rootId: 'pane1',
+  floats: [],
+  activePaneId: 'pane1',
+  expanded: true,
+  mode: 'push',
+}
+const menuActions = {
+  closeTab(sessionId, tabId) {
+    closePath.push('action')
+    closeCalls.push([sessionId, tabId])
+  },
+}
 const sidebarRight = {
   mounted: { getSnapshot: () => sidebarRightState.mounted },
+  screen: () => ({ sessionId: sidebarRightState.mounted, surface: { layout: menuLayout } }),
+  actionsFor: () => menuActions,
+  // The controller's own close runs the tab kind's teardown, so it is the path
+  // every entry prefers; `actions.closeTab` is only the fallback.
+  closeIn(sessionId, tabId) {
+    closePath.push('closeIn')
+    closeCalls.push([sessionId, tabId])
+  },
 }
 
 const disposers = []
@@ -406,7 +443,7 @@ const ctx = {
 }
 
 exported.apply(ctx)
-assert.equal(window.__DSH_SIDEBAR_SHARE__.version, '0.1.6')
+assert.equal(window.__DSH_SIDEBAR_SHARE__.version, '0.1.7')
 assert.equal(window.__DSH_SIDEBAR_SHARE__.canonicalVersion, 2)
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 350))
@@ -647,15 +684,25 @@ assert.ok(scopeOptions, 'the section renders a radio group')
 assert.equal(scopeOptions.children.flat().length, 2)
 
 const menuEntries = menuRegistrations.filter((entry) => entry.options.name === 'sidebar.right.tab.menu.item')
-assert.equal(menuEntries.length, 2, 'the tab menu must contribute two entries')
+assert.equal(menuEntries.length, 4, 'the tab menu must contribute four entries')
 const revealEntry = menuEntries.find((entry) => entry.options.id === 'sidebar-share:reveal-in-file-manager')
 const menuEntry = menuEntries.find((entry) => entry.options.id === 'sidebar-share:chat-reference')
+const closeOthersEntry = menuEntries.find((entry) => entry.options.id === 'sidebar-share:close-others')
+const closeRightEntry = menuEntries.find((entry) => entry.options.id === 'sidebar-share:close-right')
 assert.ok(revealEntry, 'the reveal entry must be registered')
 assert.ok(menuEntry, 'the chat reference entry must be registered')
+assert.ok(closeOthersEntry, 'the close-others entry must be registered')
+assert.ok(closeRightEntry, 'the close-right entry must be registered')
+assert.ok(closeOthersEntry.options.order < closeRightEntry.options.order, 'close others sorts above close right')
+assert.ok(closeRightEntry.options.order < revealEntry.options.order, 'the close actions sort above the reveal entry')
 assert.ok(revealEntry.options.order < menuEntry.options.order, 'reveal sorts above the chat reference')
+assert.equal(closeOthersEntry.options.label, '关闭其他标签页')
+assert.equal(closeRightEntry.options.label, '关闭右侧标签页')
 assert.equal(menuEntry.options.label, '引用到对话')
 assert.equal(typeof revealEntry.component, 'function')
 assert.equal(typeof menuEntry.component, 'function')
+assert.equal(typeof closeOthersEntry.component, 'function')
+assert.equal(typeof closeRightEntry.component, 'function')
 
 const tabMenu = window.__DSH_SIDEBAR_SHARE__.tabMenu
 assert.equal(typeof tabMenu.reveal, 'function')
@@ -839,6 +886,95 @@ browserItem.props.onClick({ preventDefault() {}, stopPropagation() {} })
 await nextTick()
 assert.deepEqual(clipboardWrites.at(-1), 'http://localhost:9000/#/\n')
 sidebarRightState.mounted = 'session-a'
+
+/* 「关闭其他标签页」 and 「关闭右侧标签页」 act on the clicked tab's own pane. */
+assert.deepEqual(
+  tabMenu.closeTargets('session-a', 'tabM2', 'others'),
+  ['tabM1', 'tabM3'],
+  'close others keeps the clicked tab and takes the rest of the pane',
+)
+assert.deepEqual(
+  tabMenu.closeTargets('session-a', 'tabM2', 'right'),
+  ['tabM3'],
+  'close right takes only the tabs after the clicked one',
+)
+
+closeCalls.length = 0
+closePath.length = 0
+let closeDismissed = false
+const othersItem = closeOthersEntry.component({
+  sessionId: 'session-a',
+  tab: menuLayout.tabs.tabM2,
+  dismiss: () => {
+    closeDismissed = true
+  },
+})
+assert.equal(othersItem.type, 'button')
+assert.equal(othersItem.props.role, 'menuitem')
+assert.equal(othersItem.children[1].children[0], '关闭其他标签页')
+othersItem.props.onClick({ preventDefault() {}, stopPropagation() {} })
+assert.equal(closeDismissed, true, 'a close item must dismiss the menu')
+assert.deepEqual(
+  closeCalls,
+  [['session-a', 'tabM3'], ['session-a', 'tabM1']],
+  'close others drops every other tab in the pane, right to left',
+)
+assert.deepEqual(closePath, ['closeIn', 'closeIn'], 'the controller close runs the tab kind cleanup')
+
+closeCalls.length = 0
+closePath.length = 0
+const rightItem = closeRightEntry.component({ sessionId: 'session-a', tab: menuLayout.tabs.tabM1, dismiss() {} })
+rightItem.props.onClick({ preventDefault() {}, stopPropagation() {} })
+assert.deepEqual(
+  closeCalls,
+  [['session-a', 'tabM3'], ['session-a', 'tabM2']],
+  'close right drops only the tabs after the clicked one, right to left',
+)
+
+/* A Host that does not expose `closeIn` still closes through the store action. */
+const closeIn = sidebarRight.closeIn
+delete sidebarRight.closeIn
+closeCalls.length = 0
+closePath.length = 0
+const fallbackItem = closeRightEntry.component({ sessionId: 'session-a', tab: menuLayout.tabs.tabM1, dismiss() {} })
+fallbackItem.props.onClick({ preventDefault() {}, stopPropagation() {} })
+assert.deepEqual(closeCalls, [['session-a', 'tabM3'], ['session-a', 'tabM2']], 'the store action is the fallback')
+assert.deepEqual(closePath, ['action', 'action'], 'the fallback path is the raw store action')
+sidebarRight.closeIn = closeIn
+
+/* Nothing to close on the last tab, and nothing on a lone tab either. */
+assert.equal(
+  closeRightEntry.component({ sessionId: 'session-a', tab: menuLayout.tabs.tabM3, dismiss() {} }),
+  null,
+  'the last tab has no tabs on its right',
+)
+const paneTabs = menuLayout.nodes.pane1.tabs
+menuLayout.nodes.pane1.tabs = ['tabM3']
+assert.equal(
+  closeOthersEntry.component({ sessionId: 'session-a', tab: menuLayout.tabs.tabM3, dismiss() {} }),
+  null,
+  'a lone tab has no other tabs to close',
+)
+menuLayout.nodes.pane1.tabs = paneTabs
+
+/* A session the window never adopted has no layout, so the entry stays hidden. */
+assert.equal(
+  closeOthersEntry.component({ sessionId: 'session-unknown', tab: menuLayout.tabs.tabM2, dismiss() {} }),
+  null,
+  'a session without a layout offers no close entry',
+)
+
+/* A split keeps each pane's strip separate: the second pane is never a target. */
+menuLayout.nodes.split1 = { kind: 'split', id: 'split1', axis: 'row', children: ['pane1', 'pane2'], sizes: [0.5, 0.5] }
+menuLayout.nodes.pane2 = { kind: 'pane', id: 'pane2', host: 'dock', tabs: ['tabM4'], activeTabId: 'tabM4' }
+menuLayout.tabs.tabM4 = menuTab('tabM4', 'four.md')
+menuLayout.rootId = 'split1'
+assert.deepEqual(tabMenu.closeTargets('session-a', 'tabM2', 'others'), ['tabM1', 'tabM3'], 'a split pane is not closed by its sibling pane')
+assert.deepEqual(tabMenu.closeTargets('session-a', 'tabM4', 'others'), [], 'the other pane keeps its own tabs')
+delete menuLayout.nodes.pane2
+delete menuLayout.tabs.tabM4
+delete menuLayout.nodes.split1
+menuLayout.rootId = 'pane1'
 
 /* ------------------------------------------------------------------ */
 /* 12. Sidebar scope preference                                        */

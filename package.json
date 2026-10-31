@@ -1,6 +1,6 @@
 {
   "name": "dsh-sidebar-share",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Share one right-sidebar layout across every session in the same DSH workspace, and drop the focused tab (file, browser URL, terminal screen) straight into the composer.",
   "type": "module",
   "main": "./dist/index.js",

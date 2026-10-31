@@ -200,3 +200,30 @@ harness 覆盖：v1 → v2 迁移、reset 清空并收起、首个 tab 解除 re
 - 从 registry 重新下载 tarball 校验：`dist/client.js` 含 `sidebar-share:reveal-in-file-manager`、`在访达中显示`、`在文件资源管理器中显示`，且插入顺序为 `captureInsertion()` → `focusComposer()` → `insertText()`；`PLUGIN_VERSION` 与 `package.json` 均为 `0.1.6`。
 - 发布走 `scripts/release.sh`（本机没有 macOS Keychain，退回 `~/.npmrc` 的 token，`npm whoami` = `curleaf`）。
 - 本机 web profile 是 `link:` 安装，刷新窗口即可用上 0.1.6；其它机器 `dsh plugin --profile web add dsh-sidebar-share`。
+
+## 0.1.7：tab 右键菜单加「关闭其他标签页 / 关闭右侧标签页」（2026-10-31）
+
+### 需求
+
+右侧栏 tab 的右键菜单要能批量关 tab：关掉当前分栏里「其他的」，以及「当前 tab 右边的」。槽位仍是 `sidebar.right.tab.menu.item`，宿主自带的「关闭」之后追加。
+
+### 实现
+
+- 两个新条目：`sidebar-share:close-others`（order 60，「关闭其他标签页」）、`sidebar-share:close-right`（order 70，「关闭右侧标签页」），都排在「在访达中显示」90 与「引用到对话」100 之前。
+- 作用域是**当前分栏**：`paneOfTab(layout, tabId)` 在 `layout.nodes` 里找 `kind === 'pane'` 且 `tabs` 含该 id 的节点，所以分屏出来的另一个 pane、浮窗里的 tab 都不会被牵连。
+- 目标集合：`others` = 该 pane 的 `tabs` 去掉自己；`right` = `tabs.slice(index + 1)`。没有目标就 `return null`，菜单里不出现死项。
+- 布局读取顺序：先 `sidebarRight.screen()`（控制器只认屏幕上那个会话），拿不到再用本插件镜像住的 layout store（`groups[].layoutInstances`，覆盖被镜像的其它会话）。两个都拿不到就视为无可关项。
+- 关闭调用顺序：优先 `sidebarRight.closeIn(sessionId, tabId)`——它带 `canCloseTab` 守卫，还会跑 tab 类型自己的 `closeHandlers`（终端收尾就走这里）；宿主没有这个入口时退回 `sidebarRight.actionsFor(sessionId).closeTab(sessionId, tabId)`。见 DSH `ui-sidebar-right` 的 `closeIn()`。
+- 从右往左关（`for (index = targets.length - 1; ...)`），让 kit 的 settle 把焦点留在最靠左的幸存 tab 上；每关一个是一条布局历史，撤销是逐条的。
+- 菜单项先 `dismiss()` 再动布局：和「在访达中显示」一致，菜单不能浮在刚变过的内容上。
+- 新增调试面：`tabMenu.closeTargets(sessionId, tabId, mode)` 与 `tabMenu.closeSiblings(props, mode)`，harness 直接断言目标集合。
+
+### 验证
+
+- `node test/harness.mjs`：四个条目与 order/label；`closeTargets` 的 others/right 集合；点击后 `closeIn` 按「右→左」顺序调用、`dismiss` 先于关闭；「最后一个 tab」与「只有一个 tab」时条目为 null；未采纳会话（无 layout）时条目为 null；分屏后另一个 pane 的 tab 不在目标里；`closeIn` 缺失时退回 `actions.closeTab`。
+- 真机待验证（0.1.7 未发布，本机 `link:` 安装，刷新窗口即可试）。
+
+### 兼容
+
+- 只改浏览器半（`dist/client.js`），刷新窗口即可；`PLUGIN_VERSION` 与 `package.json` 都升到 0.1.7。
+- 依赖的 `sidebarRight.closeIn` / `screen()` / `actionsFor()` 是 `ui-sidebar-right` 的控制器方法（不是 `ISidebarRight` 的公开面），DSH 升级后若改名，关闭会退回 store action；两者都没有时菜单项仍在、点击只弹 toast，不影响镜像。
