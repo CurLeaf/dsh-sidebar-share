@@ -23,11 +23,23 @@
  * expanded/mode presentation. A workspace that is empty is always applied
  * closed, so "nothing open" never turns into an empty panel popping open.
  *
- * The same plugin also contributes one extra right-sidebar tab-menu entry,
- * "引用到对话": it drops the focused tab's workspace file path / browser URL /
- * visible terminal screen into the current session's composer through the
- * public `inputActions` insertion face, so the user can then say what to do
- * with it. The entry stays hidden when the host does not expose that face.
+ * It also contributes two right-sidebar tab-menu entries:
+ *
+ *   - A file tab offers to reveal itself in the Host's file manager
+ *     (「在访达中显示」/「在文件资源管理器中显示」/「在文件管理器中显示」). The Host
+ *     resolves the tab's verified absolute path and hands it to the same
+ *     native opener the Open In control uses. The label follows the Host's
+ *     platform, not the browser's, and a failed launch is announced with a
+ *     short toast instead of a silent no-op.
+ *   - Any tab offers 「引用到对话」: it drops the tab's workspace file path,
+ *     browser URL or visible terminal screen into the composer. When the
+ *     composer's `inputActions` face is mounted it inserts an undoable edit;
+ *     otherwise it copies the reference to the clipboard and says so.
+ *
+ * Both entries work with only the `{ tab, dismiss }` props the tab-menu slot
+ * guarantees; every extra face (`inputActions`, `sessionId`, the Remote
+ * namespaces) is read from services, so a host that stops passing one cannot
+ * make an entry vanish.
  */
 window.__ModuleLoader__.load({
 	id: 'dsh-sidebar-share',
@@ -43,7 +55,7 @@ window.__ModuleLoader__.load({
 			? dockkit.EMPTY_HISTORY
 			: { entries: [], cursor: 0 };
 
-		const PLUGIN_VERSION = '0.1.4';
+		const PLUGIN_VERSION = '0.1.6';
 		const TAG = '[sidebar-share]';
 		const CANONICAL_PREFIX = 'dsh.sidebar-share.v2.';
 		const LEGACY_PREFIX = 'dsh.sidebar-share.v1.';
@@ -748,17 +760,80 @@ window.__ModuleLoader__.load({
 		};
 
 		/* ------------------------------------------------------------------ */
-		/* Sidebar → chat reference                                            */
+		/* Sidebar tab menu                                                    */
+		/*                                                                    */
+		/* Two entries on a right-sidebar tab's actions menu:                  */
+		/*                                                                    */
+		/*  - File tabs get 「在访达中显示」 (macOS) / 「在文件资源管理器中显示」   */
+		/*    (Windows) / 「在文件管理器中显示」 (Linux). The Host resolves the  */
+		/*    tab's verified absolute path and reveals it with the native       */
+		/*    opener the Open In control already uses.                          */
+		/*  - Any tab gets 「引用到对话」, which drops its file path, browser URL  */
+		/*    or terminal screen into the composer — or the clipboard when the  */
+		/*    composer insertion face is not mounted.                           */
+		/*                                                                    */
+		/* Both entries work with only `{ tab, dismiss }`; extra faces come from */
+		/* services, so an entry cannot silently disappear when a prop changes.  */
 		/* ------------------------------------------------------------------ */
 
 		const BROWSER_PREFIX = 'dsh.sidebar-browser.v1.';
+		const MENU_STYLE_ID = 'dsh-sidebar-share/tab-menu.css';
+		const TOAST_CLASS = 'dsh-sidebar-share-toast';
 		const CHAT_MENU_ID = 'sidebar-share:chat-reference';
 		const CHAT_MENU_LABEL = '引用到对话';
-		const CHAT_MENU_STYLE_ID = 'dsh-sidebar-share/chat-reference.css';
+		const REVEAL_MENU_ID = 'sidebar-share:reveal-in-file-manager';
+		const REVEAL_MENU_ORDER = 90;
+		const CHAT_MENU_ORDER = 100;
 		const TERMINAL_MAX_LINES = 60;
+		const TOAST_MS = 3200;
+		const FILE_ADDRESS_PREFIX = 'dsh-resource://file/';
+		/** The three desktop behaviours the Host can reveal a path with. */
+		const FILE_MANAGER_LABELS = {
+			finder: '在访达中显示',
+			explorer: '在文件资源管理器中显示',
+			directory: '在文件管理器中显示',
+		};
+		const FILE_MANAGER_TITLES = {
+			finder: '在 Finder 中显示这个文件的位置',
+			explorer: '在文件资源管理器中显示这个文件的位置',
+			directory: '在文件管理器中显示这个文件的位置',
+		};
 
-		const decodePath = (value) => {
-			if (typeof value !== 'string') return '';
+		/** The event guards every menu item uses before acting. */
+		const stopEvent = (event) => {
+			try {
+				if (event && typeof event.preventDefault === 'function') event.preventDefault();
+				if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
+			} catch {}
+		};
+
+		const messageOf = (error) => {
+			if (error === undefined || error === null) return '';
+			if (typeof error === 'string') return error;
+			if (typeof error.message === 'string' && error.message.length > 0) return error.message;
+			return String(error);
+		};
+
+		/** A short, non-blocking notice; the menu has already closed when this runs. */
+		const showMenuToast = (text) => {
+			try {
+				if (typeof document === 'undefined' || !document.body) return;
+				const previous = document.querySelector('.' + TOAST_CLASS);
+				if (previous && typeof previous.remove === 'function') previous.remove();
+				const node = document.createElement('div');
+				node.className = TOAST_CLASS;
+				node.setAttribute('role', 'alert');
+				node.textContent = String(text);
+				document.body.appendChild(node);
+				setTimeout(() => {
+					try {
+						node.remove();
+					} catch {}
+				}, TOAST_MS);
+			} catch {}
+		};
+
+		const decodeSegment = (value) => {
 			try {
 				return decodeURIComponent(value);
 			} catch {
@@ -766,14 +841,53 @@ window.__ModuleLoader__.load({
 			}
 		};
 
-		/** Workspace-relative path behind a Preview tab, or undefined for other tabs. */
-		const filePathOfTab = (tab) => {
-			if (!isObject(tab) || typeof tab.contentId !== 'string') return undefined;
-			const match = /^dsh-resource:\/\/file\/session\/[^/]+\/(.*)$/.exec(tab.contentId);
-			if (!match) return undefined;
-			const path = decodePath(match[1]);
-			return path.length > 0 ? path : undefined;
+		/**
+		 * Split a `dsh-resource://file/…` address into its scope and path.
+		 *
+		 * `session` scope carries a workspace-relative path, or an absolute one
+		 * when the file sits outside the workspace / the root was unknown. The
+		 * empty leading segment an absolute path produces survives the split, so
+		 * the path stays absolute exactly when its address says so.
+		 */
+		const parseFileAddress = (address) => {
+			if (typeof address !== 'string' || !address.startsWith(FILE_ADDRESS_PREFIX)) return undefined;
+			const end = address.search(/[?#]/);
+			const body = end === -1 ? address.slice(FILE_ADDRESS_PREFIX.length) : address.slice(FILE_ADDRESS_PREFIX.length, end);
+			const parts = body.split('/');
+			const scope = parts.shift();
+			if (scope === 'session') {
+				const sessionId = parts.shift();
+				if (sessionId === undefined || sessionId === '') return undefined;
+				return {
+					scope,
+					sessionId: decodeSegment(sessionId),
+					path: parts.map(decodeSegment).join('/'),
+				};
+			}
+			if (scope === 'absolute') {
+				const unc = parts[0] === '' && parts.length > 1;
+				const segments = (unc ? parts.slice(1) : parts).map(decodeSegment);
+				if (segments.length === 0 || segments[0] === '') return undefined;
+				const joined = segments.join('/');
+				if (unc) return { scope, path: '//' + joined };
+				return { scope, path: /^[A-Za-z]:$/.test(segments[0]) ? joined : '/' + joined };
+			}
+			return undefined;
 		};
+
+		/** Whether a path is already absolute in either spelling the Host accepts. */
+		const isAbsoluteHostPath = (path) =>
+			typeof path === 'string' &&
+			(path.startsWith('/') || /^[A-Za-z]:[/\\]/.test(path) || path.startsWith('\\\\'));
+
+		/** The file path behind a file tab, or undefined for every other tab. */
+		const filePathOfTab = (tab) => {
+			const parsed = parseFileAddress(tab && tab.contentId);
+			if (!parsed) return undefined;
+			return parsed.path.length > 0 ? parsed.path : undefined;
+		};
+
+		const isFileTab = (tab) => isObject(tab) && filePathOfTab(tab) !== undefined;
 
 		/** Serialize a path the way the `@` reference source expects it. */
 		const fileMention = (path) => {
@@ -824,7 +938,7 @@ window.__ModuleLoader__.load({
 			return undefined;
 		};
 
-		/** What lands in the composer when the user picks "引用到对话". */
+		/** What lands in the composer when the user picks 「引用到对话」. */
 		const chatReferenceText = (tab, sessionId) => {
 			const kind = chatReferenceKind(tab);
 			if (kind === 'file') {
@@ -846,112 +960,402 @@ window.__ModuleLoader__.load({
 			return '';
 		};
 
+		/** The visible composer editor, or undefined when no session is on screen. */
+		const composerEditor = () => {
+			if (typeof document === 'undefined') return undefined;
+			const editors = [...document.querySelectorAll('[data-conversation-region="composer"] [contenteditable="true"]')];
+			return editors.filter((node) => node.getClientRects().length > 0).pop() ?? editors.pop();
+		};
+
 		const focusComposer = () => {
 			try {
-				if (typeof document === 'undefined') return;
-				const editor = document.querySelector('[data-conversation-region="composer"] [contenteditable="true"]');
+				const editor = composerEditor();
 				if (editor && typeof editor.focus === 'function') editor.focus();
 			} catch {}
 		};
 
-		const copyText = (text) => {
+		/** The pre-permission copy path; the Clipboard API is not available everywhere. */
+		const legacyCopyText = (text) => {
+			try {
+				if (typeof document === 'undefined' || !document.body) return false;
+				const area = document.createElement('textarea');
+				area.value = text;
+				area.setAttribute('readonly', '');
+				area.style.position = 'fixed';
+				area.style.top = '0';
+				area.style.opacity = '0';
+				document.body.appendChild(area);
+				if (typeof area.select === 'function') area.select();
+				const copied = typeof document.execCommand === 'function' && document.execCommand('copy') === true;
+				area.remove();
+				return copied;
+			} catch {
+				return false;
+			}
+		};
+
+		/** Copy text, reporting whether it reached the clipboard. */
+		const copyText = async (text) => {
 			try {
 				const clipboard = typeof navigator === 'undefined' ? undefined : navigator.clipboard;
 				if (clipboard && typeof clipboard.writeText === 'function') {
-					clipboard.writeText(text);
+					await clipboard.writeText(text);
 					return true;
 				}
 			} catch {}
-			return false;
+			return legacyCopyText(text);
 		};
 
 		/**
-		 * The composer's public insertion face: capture a caret span, then insert one
-		 * undoable plain-text edit. Falls back to the clipboard when the composer has
-		 * no live editor (e.g. another window owns the draft).
+		 * The composer's public insertion face: capture the caret span, put the
+		 * caret back into the editor, then insert one undoable plain-text edit.
+		 *
+		 * The order matters. The tab menu is what the user clicked, so the editor
+		 * is blurred and its DOM caret would land at the start if it were focused
+		 * after the edit; focusing first keeps Lexical's caret where the user left
+		 * it and lets the edit move it to the end of the inserted text.
 		 */
 		const insertIntoComposer = (inputActions, text) => {
 			if (typeof text !== 'string' || text.length === 0) return false;
 			try {
 				const span = inputActions.captureInsertion();
-				if (span && inputActions.insertText(text, span)) {
-					setTimeout(focusComposer, 0);
-					return true;
-				}
+				focusComposer();
+				if (span && inputActions.insertText(text, span)) return true;
 			} catch (error) {
 				warn('composer insertion failed', error);
 			}
-			if (copyText(text)) info('composer insertion unavailable; copied the reference to the clipboard');
 			return false;
 		};
 
-		const installChatMenuStyles = () => {
+		/** A `remote.‹namespace›` service, or undefined when the Host lacks it. */
+		const remoteNamespace = (ctx, name) => {
+			try {
+				const remote = ctx.get('remote');
+				const namespace = remote ? remote[name] : undefined;
+				if (namespace) return namespace;
+			} catch {}
+			try {
+				return ctx.get('remote.' + name);
+			} catch {
+				return undefined;
+			}
+		};
+
+		/** The Session the right sidebar is currently showing, when one is. */
+		const onScreenSessionId = (ctx) => {
+			try {
+				const right = ctx.get('sidebarRight');
+				const mounted = right && right.mounted;
+				const value = mounted && typeof mounted.getSnapshot === 'function' ? mounted.getSnapshot() : undefined;
+				return typeof value === 'string' && value.length > 0 ? value : undefined;
+			} catch {
+				return undefined;
+			}
+		};
+
+		const sessionIdOfReference = (props, ctx, tab) => {
+			if (props && typeof props.sessionId === 'string' && props.sessionId.length > 0) return props.sessionId;
+			const parsed = parseFileAddress(tab && tab.contentId);
+			if (parsed && parsed.scope === 'session') return parsed.sessionId;
+			return onScreenSessionId(ctx);
+		};
+
+		/* ------------------------------------------------------------------ */
+		/* Which native file manager this Host can open                       */
+		/* ------------------------------------------------------------------ */
+
+		/** `undefined` until the probe answers; then the opener name ('finder' | 'explorer' | 'directory'). */
+		let fileManagerState;
+		let fileManagerProbe;
+		const fileManagerListeners = new Set();
+
+		const publishFileManager = (value) => {
+			if (value === fileManagerState) return;
+			fileManagerState = value;
+			for (const listener of [...fileManagerListeners]) {
+				try {
+					listener();
+				} catch {}
+			}
+		};
+
+		const subscribeFileManager = (listener) => {
+			fileManagerListeners.add(listener);
+			return () => {
+				fileManagerListeners.delete(listener);
+			};
+		};
+
+		const fileManagerSnapshot = () => fileManagerState;
+
+		/** Read the Host catalog's file-manager entry (the route the Open In button uses). */
+		const readOpenInAppApps = async () => {
+			if (typeof fetch !== 'function') return undefined;
+			try {
+				const response = await fetch('open-in-app/apps', {
+					credentials: 'same-origin',
+					headers: { accept: 'application/json' },
+				});
+				if (!response || response.ok !== true) return undefined;
+				const body = await response.json();
+				return isObject(body) && Array.isArray(body.apps) ? body.apps : undefined;
+			} catch {
+				return undefined;
+			}
+		};
+
+		const fileManagerFromApps = (apps) => {
+			if (apps.includes('finder')) return 'finder';
+			if (apps.includes('explorer')) return 'explorer';
+			if (apps.includes('filemanager')) return 'directory';
+			return null;
+		};
+
+		/** The Host home directory, when the Remote host facts already carry it. */
+		const hostHome = (ctx) => {
+			try {
+				const remote = ctx.get('remote');
+				const facts = remote ? remote.$host : undefined;
+				return facts && typeof facts.home === 'string' && facts.home.length > 0 ? facts.home : undefined;
+			} catch {
+				return undefined;
+			}
+		};
+
+		/** Fallback when the catalog route is unavailable: the Host home spelling. */
+		const guessFileManager = (ctx) => {
+			const home = hostHome(ctx);
+			if (typeof home !== 'string' || home.length === 0) return undefined;
+			if (home.startsWith('/Users/')) return 'finder';
+			if (/^[A-Za-z]:[\\/]/.test(home) || home.startsWith('\\\\')) return 'explorer';
+			if (home.startsWith('/home/') || home.startsWith('/root')) return 'directory';
+			return undefined;
+		};
+
+		const probeFileManager = async (ctx) => {
+			// 1. The Host catalog names the platform's file manager entry exactly.
+			const apps = await readOpenInAppApps();
+			const matched = apps === undefined ? null : fileManagerFromApps(apps);
+			if (typeof matched === 'string') return matched;
+			// 2. The Home spelling identifies the same family even when the catalog
+			//    hides its file-manager row (a display-less launch still reveals
+			//    through the desktop's session bus).
+			const guessed = guessFileManager(ctx);
+			if (guessed !== undefined) return guessed;
+			// 3. Nothing identifies the family: only a Host that can open paths at
+			//    all earns the generic label.
+			const session = remoteNamespace(ctx, 'session');
+			if (session && typeof session.canOpenWorkspacePath === 'function') {
+				try {
+					const result = await session.canOpenWorkspacePath();
+					if (result && result.ok === true && result.value === true) return 'directory';
+				} catch {}
+			}
+			return undefined;
+		};
+
+		/**
+		 * Resolve the Host file manager once; an unknown answer is retried on the
+		 * next menu open because a service may simply not have been mounted yet.
+		 */
+		const ensureFileManagerProbe = (ctx, options) => {
+			if (options && options.force === true) fileManagerProbe = undefined;
+			if (fileManagerProbe !== undefined) return fileManagerProbe;
+			const running = probeFileManager(ctx)
+				.then((value) => {
+					if (value === undefined) {
+						fileManagerProbe = undefined;
+						publishFileManager(undefined);
+						return undefined;
+					}
+					publishFileManager(value);
+					return value;
+				})
+				.catch((error) => {
+					warn('file manager probe failed', error);
+					fileManagerProbe = undefined;
+					publishFileManager(undefined);
+					return undefined;
+				});
+			fileManagerProbe = running;
+			return running;
+		};
+
+		/**
+		 * Probe once the Remote is mounted, then retry a few times while the answer
+		 * stays unknown — the host facts that carry the Home directory arrive with
+		 * the first connection generation, not with the service itself.
+		 */
+		const scheduleFileManagerProbe = (ctx, attempt = 0) => {
+			const delay = attempt === 0 ? 0 : Math.min(4000, 400 * 2 ** attempt);
+			setTimeout(() => {
+				if (fileManagerState !== undefined) return;
+				Promise.resolve(ensureFileManagerProbe(ctx)).then((value) => {
+					if (value === undefined && attempt < 5) scheduleFileManagerProbe(ctx, attempt + 1);
+				}, () => {});
+			}, delay);
+		};
+
+		/* ------------------------------------------------------------------ */
+		/* Reveal one file tab in the Host's file manager                     */
+		/* ------------------------------------------------------------------ */
+
+		/** The absolute Host path behind a file tab, or undefined when it cannot be proven. */
+		const hostPathOfTab = async (ctx, tab) => {
+			const parsed = parseFileAddress(tab && tab.contentId);
+			if (!parsed) return undefined;
+			if (parsed.scope === 'absolute') return parsed.path;
+			if (isAbsoluteHostPath(parsed.path)) return parsed.path;
+			if (parsed.path.length === 0) return undefined;
+			const files = remoteNamespace(ctx, 'workspaceFiles');
+			if (!files || typeof files.stat !== 'function') return undefined;
+			const result = await files.stat(parsed.sessionId, parsed.path);
+			if (result && result.ok === true && result.value && typeof result.value.absolutePath === 'string') {
+				return result.value.absolutePath;
+			}
+			return undefined;
+		};
+
+		const revealTabInFileManager = async (ctx, tab, manager) => {
+			const label = FILE_MANAGER_LABELS[manager] ?? FILE_MANAGER_LABELS.directory;
+			try {
+				const session = remoteNamespace(ctx, 'session');
+				if (!session || typeof session.openWorkspacePath !== 'function') {
+					throw new Error('宿主没有提供打开文件位置的能力');
+				}
+				const path = await hostPathOfTab(ctx, tab);
+				if (path === undefined) throw new Error('无法确定这个文件在磁盘上的路径');
+				const result = await session.openWorkspacePath({ path, action: 'reveal' });
+				if (!result || result.ok !== true) {
+					throw new Error(messageOf(result && result.error) || '宿主拒绝了这次请求');
+				}
+				info('revealed', path, 'in', manager);
+			} catch (error) {
+				warn('reveal failed', error);
+				showMenuToast(label + '失败：' + (messageOf(error) || '未知原因'));
+			}
+		};
+
+		/* ------------------------------------------------------------------ */
+		/* Menu rendering                                                     */
+		/* ------------------------------------------------------------------ */
+
+		const installMenuStyles = () => {
 			try {
 				if (typeof document === 'undefined') return;
-				if (document.querySelector('style[data-plugin-css="' + CHAT_MENU_STYLE_ID + '"]') !== null) return;
+				if (document.querySelector('style[data-plugin-css="' + MENU_STYLE_ID + '"]') !== null) return;
 				const tag = document.createElement('style');
 				tag.dataset.plugin = 'dsh-sidebar-share';
-				tag.dataset.pluginCss = CHAT_MENU_STYLE_ID;
+				tag.dataset.pluginCss = MENU_STYLE_ID;
 				tag.textContent =
-					'.dsh-sidebar-share-menu-item{display:flex;align-items:center;gap:8px;width:100%;height:30px;padding:0 10px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary,inherit);font:inherit;font-size:12px;line-height:1;text-align:left;cursor:pointer}'
-					+ '.dsh-sidebar-share-menu-item:hover{background:var(--dsw-alias-bg-layer-3,rgba(127,127,127,.14))}'
-					+ '.dsh-sidebar-share-menu-icon{display:inline-flex;flex:none;color:var(--dsw-alias-label-secondary,currentColor)}';
+					'.dsh-sidebar-share-menu-item{display:flex;align-items:center;gap:8px;width:100%;height:28px;padding:0 8px;border:0;border-radius:var(--dsw-radius-md,6px);background:transparent;color:var(--dsw-alias-label-primary,inherit);font:inherit;font-size:12px;line-height:1;white-space:nowrap;text-align:left;cursor:pointer}'
+					+ '.dsh-sidebar-share-menu-item:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.14))}'
+					+ '.dsh-sidebar-share-menu-item:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#2f6fed);outline-offset:-2px}'
+					+ '.dsh-sidebar-share-menu-icon{display:inline-flex;flex:none;align-items:center;justify-content:center;width:14px;height:14px;color:var(--dsw-alias-label-secondary,currentColor)}'
+					+ '.dsh-sidebar-share-toast{position:fixed;top:40px;left:50%;z-index:1100;transform:translateX(-50%);width:max-content;max-width:min(640px,calc(100vw - 48px));padding:10px 14px;border-radius:var(--dsw-radius-lg,12px);background:var(--dsw-alias-toast-bg,#2f2f2f);color:var(--dsw-alias-toast-label,#fff);font-size:12.5px;line-height:1.5;text-align:center;box-shadow:0 6px 24px rgba(0,0,0,.28);pointer-events:none}';
 				document.head.appendChild(tag);
 			} catch {}
 		};
 
-		const createChatMenuItem = (react) => {
-			const h = react.createElement;
-			const icon = h('span', { className: 'dsh-sidebar-share-menu-icon', 'aria-hidden': 'true' },
-				h('svg', { width: 12, height: 12, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5 },
+		const revealIcon = (h) =>
+			h('span', { className: 'dsh-sidebar-share-menu-icon', 'aria-hidden': 'true' },
+				h('svg', { width: 14, height: 14, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.3 },
+					h('path', { d: 'M1.8 4.1c0-.7.6-1.3 1.3-1.3h2.3c.4 0 .8.2 1 .5l.8 1h4.6c.7 0 1.3.6 1.3 1.3v5.3c0 .7-.6 1.3-1.3 1.3H3.1c-.7 0-1.3-.6-1.3-1.3z', strokeLinejoin: 'round' })));
+
+		const chatIcon = (h) =>
+			h('span', { className: 'dsh-sidebar-share-menu-icon', 'aria-hidden': 'true' },
+				h('svg', { width: 14, height: 14, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5 },
 					h('path', { d: 'M2.5 8h7.2', strokeLinecap: 'round' }),
 					h('path', { d: 'M8.4 5.2 11.2 8l-2.8 2.8', strokeLinecap: 'round', strokeLinejoin: 'round' }),
 					h('path', { d: 'M12.6 3v10', strokeLinecap: 'round', opacity: 0.5 })));
+
+		const createRevealMenuItem = (react, ctx) => {
+			const h = react.createElement;
+			const RevealItem = (props) => {
+				const [manager, setManager] = react.useState(fileManagerSnapshot);
+				if (typeof react.useEffect === 'function') {
+					react.useEffect(() => {
+						ensureFileManagerProbe(ctx);
+						return subscribeFileManager(() => setManager(fileManagerSnapshot()));
+					}, []);
+				}
+				const tab = props ? props.tab : undefined;
+				if (!isFileTab(tab) || typeof manager !== 'string') return null;
+				const label = FILE_MANAGER_LABELS[manager] ?? FILE_MANAGER_LABELS.directory;
+				const title = FILE_MANAGER_TITLES[manager] ?? FILE_MANAGER_TITLES.directory;
+				return h('button', {
+					type: 'button',
+					role: 'menuitem',
+					className: 'dsh-sidebar-share-menu-item',
+					title,
+					onClick: (event) => {
+						stopEvent(event);
+						const dismiss = props && typeof props.dismiss === 'function' ? props.dismiss : undefined;
+						if (dismiss) dismiss();
+						revealTabInFileManager(ctx, tab, manager);
+					},
+				}, revealIcon(h), h('span', null, label));
+			};
+			RevealItem.displayName = 'SidebarShareRevealItem';
+			return RevealItem;
+		};
+
+		const createChatMenuItem = (react, ctx) => {
+			const h = react.createElement;
 			const ChatReferenceItem = (props) => {
 				const tab = props ? props.tab : undefined;
-				const inputActions = props ? props.inputActions : undefined;
-				const sessionId = props ? props.sessionId : undefined;
-				if (chatReferenceKind(tab) === undefined || !inputActions) return null;
+				if (chatReferenceKind(tab) === undefined) return null;
 				return h('button', {
 					type: 'button',
 					role: 'menuitem',
 					className: 'dsh-sidebar-share-menu-item',
 					title: '把侧栏里的文件、页面或终端输出插入输入框',
-					onClick: (event) => {
-						try {
-							event.preventDefault();
-							event.stopPropagation();
-						} catch {}
-						const text = chatReferenceText(tab, sessionId);
-						insertIntoComposer(inputActions, text);
-						try {
-							if (props && typeof props.dismiss === 'function') props.dismiss();
-						} catch {}
+					onClick: async (event) => {
+						stopEvent(event);
+						const dismiss = props && typeof props.dismiss === 'function' ? props.dismiss : undefined;
+						const text = chatReferenceText(tab, sessionIdOfReference(props, ctx, tab));
+						const inputActions = props ? props.inputActions : undefined;
+						const inserted = inputActions ? insertIntoComposer(inputActions, text) : false;
+						if (dismiss) dismiss();
+						if (inserted) return;
+						if (text.length === 0) {
+							showMenuToast('这个标签没有可引用的内容');
+							return;
+						}
+						if (await copyText(text)) {
+							showMenuToast('已复制到剪贴板，粘贴到输入框即可');
+							return;
+						}
+						showMenuToast('无法写入输入框，请手动复制');
 					},
-				}, icon, h('span', null, CHAT_MENU_LABEL));
+				}, chatIcon(h), h('span', null, CHAT_MENU_LABEL));
 			};
 			ChatReferenceItem.displayName = 'SidebarShareChatReferenceItem';
 			return ChatReferenceItem;
 		};
 
-		/** One `sidebar.right.tab.menu.item` entry; silent when the slot is absent. */
-		const registerChatMenuItem = (slots, disposers) => {
-			try {
-				if (!slots || typeof slots.inject !== 'function' || typeof slots.register !== 'function') return;
-				const react = requireReact();
-				if (!react || typeof react.createElement !== 'function') return;
-				installChatMenuStyles();
-				const dispose = slots.inject('sidebar.right.tab.menu.item', () => slots.register({
-					name: 'sidebar.right.tab.menu.item',
-					id: CHAT_MENU_ID,
-					order: 100,
-					label: CHAT_MENU_LABEL,
-				}, createChatMenuItem(react)));
-				if (typeof dispose === 'function') disposers.push(dispose);
-				info('chat reference menu registered');
-			} catch (error) {
-				warn('chat reference menu unavailable', error);
-			}
+		/** Both `sidebar.right.tab.menu.item` entries; silent when the slot is absent. */
+		const registerTabMenuItems = (slots, disposers, ctx) => {
+			if (!slots || typeof slots.inject !== 'function' || typeof slots.register !== 'function') return;
+			const react = requireReact();
+			if (!react || typeof react.createElement !== 'function') return;
+			installMenuStyles();
+			const register = (id, order, label, component, failure) => {
+				try {
+					const dispose = slots.inject('sidebar.right.tab.menu.item', () => slots.register({
+						name: 'sidebar.right.tab.menu.item',
+						id,
+						order,
+						label,
+					}, component));
+					if (typeof dispose === 'function') disposers.push(dispose);
+					info(failure + ' menu registered');
+				} catch (error) {
+					warn(failure + ' menu unavailable', error);
+				}
+			};
+			register(REVEAL_MENU_ID, REVEAL_MENU_ORDER, FILE_MANAGER_LABELS.finder, createRevealMenuItem(react, ctx), 'reveal');
+			register(CHAT_MENU_ID, CHAT_MENU_ORDER, CHAT_MENU_LABEL, createChatMenuItem(react, ctx), 'chat reference');
 		};
 
 		/* ------------------------------------------------------------------ */
@@ -1237,6 +1641,8 @@ window.__ModuleLoader__.load({
 						}
 					}
 					groups.clear();
+					fileManagerProbe = undefined;
+					publishFileManager(undefined);
 					sessionService = undefined;
 					workspaceService = undefined;
 					mapping = { dirty: true, bySession: new Map(), byWorkspace: new Map(), archived: new Set() };
@@ -1250,7 +1656,16 @@ window.__ModuleLoader__.load({
 				if (typeof ctx.effect === 'function') {
 					ctx.effect(() => {
 						slots.resolveStore = resolveStore;
-						registerChatMenuItem(slots, disposers);
+						registerTabMenuItems(slots, disposers, ctx);
+						if (typeof ctx.inject === 'function') {
+							try {
+								ctx.inject(['remote'], () => scheduleFileManagerProbe(ctx));
+							} catch {
+								scheduleFileManagerProbe(ctx);
+							}
+						} else {
+							scheduleFileManagerProbe(ctx);
+						}
 						bindScopePreference();
 						ensureScopeSettings();
 						window.__DSH_SIDEBAR_SHARE_APPLIED__ = true;
@@ -1293,6 +1708,16 @@ window.__ModuleLoader__.load({
 								chatReference: {
 									kindOf: chatReferenceKind,
 									textOf: chatReferenceText,
+								},
+								tabMenu: {
+									fileManager: fileManagerSnapshot,
+									hostHome: () => hostHome(ctx),
+									catalogApps: () => readOpenInAppApps(),
+									fileManagerLabel: () => FILE_MANAGER_LABELS[fileManagerSnapshot()] ?? null,
+									refreshFileManager: () => ensureFileManagerProbe(ctx, { force: true }),
+									resolvePath: (tab) => hostPathOfTab(ctx, tab),
+									reveal: (tab) => revealTabInFileManager(ctx, tab, fileManagerSnapshot() ?? 'directory'),
+									parseAddress: parseFileAddress,
 								},
 							};
 						} catch {}

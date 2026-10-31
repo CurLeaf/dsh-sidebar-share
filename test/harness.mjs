@@ -41,6 +41,32 @@ globalThis.window = { localStorage }
 console.info = () => {}
 console.warn = () => {}
 
+// The Host catalog route the reveal entry reads to learn which native file
+// manager this deployment has. Tests mutate `openInAppApps`/`fetchMode` and
+// re-probe through the debug face.
+const fetchCalls = []
+let openInAppApps = ['finder']
+let fetchMode = 'ok'
+globalThis.fetch = async (input) => {
+  fetchCalls.push(String(input))
+  if (fetchMode === 'fail') throw new Error('offline')
+  return { ok: true, json: async () => ({ apps: openInAppApps }) }
+}
+
+const clipboardWrites = []
+Object.defineProperty(globalThis, 'navigator', {
+  configurable: true,
+  writable: true,
+  value: {
+    clipboard: {
+      writeText(text) {
+        clipboardWrites.push(text)
+        return Promise.resolve()
+      },
+    },
+  },
+})
+
 const fakeReact = {
   createElement(type, props, ...children) {
     return { type, props: props || {}, children }
@@ -330,10 +356,44 @@ const configForms = {
   },
 }
 
+const remoteCalls = { stat: [], reveal: [], canOpen: 0 }
+const remoteState = {
+  canOpen: true,
+  stat(sessionId, path) {
+    return { ok: true, value: { absolutePath: '/repo/' + path, version: 'v1' } }
+  },
+  reveal() {
+    return { ok: true, value: { opened: true } }
+  },
+}
+const remote = {
+  $host: { home: '/home/harness', isLoopback: true },
+  session: {
+    async canOpenWorkspacePath() {
+      remoteCalls.canOpen += 1
+      return { ok: true, value: remoteState.canOpen }
+    },
+    async openWorkspacePath(request) {
+      remoteCalls.reveal.push(request)
+      return remoteState.reveal(request)
+    },
+  },
+  workspaceFiles: {
+    async stat(sessionId, path) {
+      remoteCalls.stat.push([sessionId, path])
+      return remoteState.stat(sessionId, path)
+    },
+  },
+}
+const sidebarRightState = { mounted: 'session-a' }
+const sidebarRight = {
+  mounted: { getSnapshot: () => sidebarRightState.mounted },
+}
+
 const disposers = []
 const ctx = {
   get(name) {
-    return { slots, sessions, workspaces, configForms }[name]
+    return { slots, sessions, workspaces, configForms, remote, sidebarRight }[name]
   },
   effect(callback) {
     const dispose = callback()
@@ -346,10 +406,11 @@ const ctx = {
 }
 
 exported.apply(ctx)
-assert.equal(window.__DSH_SIDEBAR_SHARE__.version, '0.1.4')
+assert.equal(window.__DSH_SIDEBAR_SHARE__.version, '0.1.6')
 assert.equal(window.__DSH_SIDEBAR_SHARE__.canonicalVersion, 2)
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 350))
+const nextTick = () => new Promise((resolve) => setTimeout(resolve, 0))
 const v2 = () => JSON.parse(localStorage.getItem('dsh.sidebar-share.v2.workspace-1'))
 const v2two = () => JSON.parse(localStorage.getItem('dsh.sidebar-share.v2.workspace-2'))
 const v3 = () => JSON.parse(localStorage.getItem('dsh.sidebar-share.v2.workspace-3'))
@@ -572,11 +633,9 @@ assert.equal(chatReference.textOf({ id: 'tabB', kind: 'browser' }, 'session-a'),
 assert.equal(chatReference.kindOf({ id: 'term', kind: 'terminal', contentId: 'sidebar://terminal/abc' }), 'terminal')
 
 /* ------------------------------------------------------------------ */
-/* 11. Tab menu entry                                                  */
+/* 11. Tab menu: entries, address parsing, reveal, reference fallback  */
 /* ------------------------------------------------------------------ */
 
-const menuEntry = menuRegistrations.find((entry) => entry.options.name === 'sidebar.right.tab.menu.item')
-assert.ok(menuEntry, 'the tab menu entry must be registered')
 const scopeEntry = menuRegistrations.find((entry) => entry.options.name === 'plugins.bundle.config')
 assert.ok(scopeEntry, 'the settings row must be registered')
 assert.equal(scopeEntry.options.key, 'dsh-sidebar-share', 'the row is keyed by the bundle name')
@@ -586,18 +645,123 @@ assert.equal(scopeNode.type, 'section', 'the settings row renders a section')
 const scopeOptions = scopeNode.children.find((child) => child && child.props && child.props.role === 'radiogroup')
 assert.ok(scopeOptions, 'the section renders a radio group')
 assert.equal(scopeOptions.children.flat().length, 2)
-assert.equal(menuEntry.options.name, 'sidebar.right.tab.menu.item')
-assert.equal(menuEntry.options.id, 'sidebar-share:chat-reference')
+
+const menuEntries = menuRegistrations.filter((entry) => entry.options.name === 'sidebar.right.tab.menu.item')
+assert.equal(menuEntries.length, 2, 'the tab menu must contribute two entries')
+const revealEntry = menuEntries.find((entry) => entry.options.id === 'sidebar-share:reveal-in-file-manager')
+const menuEntry = menuEntries.find((entry) => entry.options.id === 'sidebar-share:chat-reference')
+assert.ok(revealEntry, 'the reveal entry must be registered')
+assert.ok(menuEntry, 'the chat reference entry must be registered')
+assert.ok(revealEntry.options.order < menuEntry.options.order, 'reveal sorts above the chat reference')
 assert.equal(menuEntry.options.label, '引用到对话')
+assert.equal(typeof revealEntry.component, 'function')
 assert.equal(typeof menuEntry.component, 'function')
 
-assert.equal(
-  menuEntry.component({ tab: { id: 'tab3', kind: 'guide' }, inputActions: {}, dismiss() {} }),
-  null,
-  'unsupported tabs render nothing',
-)
+const tabMenu = window.__DSH_SIDEBAR_SHARE__.tabMenu
+assert.equal(typeof tabMenu.reveal, 'function')
+assert.equal(typeof tabMenu.resolvePath, 'function')
+
+/* Address parsing: workspace-relative, absolute-in-session, and absolute scope. */
+assert.deepEqual(tabMenu.parseAddress('dsh-resource://file/session/session-a/docs/my%20plan.md'), {
+  scope: 'session',
+  sessionId: 'session-a',
+  path: 'docs/my plan.md',
+})
+assert.deepEqual(tabMenu.parseAddress('dsh-resource://file/session/session-a//home/x/y.md'), {
+  scope: 'session',
+  sessionId: 'session-a',
+  path: '/home/x/y.md',
+})
+assert.deepEqual(tabMenu.parseAddress('dsh-resource://file/absolute/home/x/y.md'), {
+  scope: 'absolute',
+  path: '/home/x/y.md',
+})
+assert.deepEqual(tabMenu.parseAddress('dsh-resource://file/absolute/C%3A/Users/x.md'), {
+  scope: 'absolute',
+  path: 'C:/Users/x.md',
+})
+assert.deepEqual(tabMenu.parseAddress('dsh-resource://file/absolute//server/share/x.md'), {
+  scope: 'absolute',
+  path: '//server/share/x.md',
+})
+assert.equal(tabMenu.parseAddress('sidebar://terminal/abc'), undefined)
+assert.equal(tabMenu.parseAddress('dsh-resource://other/x'), undefined)
+
+/* The Host catalog's file-manager entry decides the label. */
+await nextTick()
+assert.equal(tabMenu.fileManager(), 'finder', 'the finder entry from the catalog is the opener')
+assert.equal(tabMenu.fileManagerLabel(), '在访达中显示')
+assert.ok(fetchCalls.includes('open-in-app/apps'), 'the entry reads the same catalog route as Open In')
+
+/* Only file tabs get the entry. */
+assert.equal(revealEntry.component({ tab: { id: 'tab3', kind: 'guide' }, dismiss() {} }), null)
+assert.equal(revealEntry.component({ tab: { id: 'tabB', kind: 'browser' }, dismiss() {} }), null)
 
 let dismissed = false
+const revealItem = revealEntry.component({
+  tab: fileTab,
+  dismiss: () => {
+    dismissed = true
+  },
+})
+assert.equal(revealItem.type, 'button')
+assert.equal(revealItem.props.role, 'menuitem')
+assert.equal(revealItem.children[1].children[0], '在访达中显示')
+assert.equal(dismissed, false)
+revealItem.props.onClick({ preventDefault() {}, stopPropagation() {} })
+assert.equal(dismissed, true, 'an acting menu item must dismiss the menu')
+await nextTick()
+assert.deepEqual(remoteCalls.stat.at(-1), ['session-a', 'coupon/coupon-exact.png'])
+assert.deepEqual(remoteCalls.reveal.at(-1), {
+  path: '/repo/coupon/coupon-exact.png',
+  action: 'reveal',
+})
+
+/* An absolute address needs no workspace stat. */
+const statCount = remoteCalls.stat.length
+const absoluteTab = {
+  id: 'tabZ',
+  kind: 'text',
+  contentId: 'dsh-resource://file/absolute/home/nope/x.md',
+  title: 'x.md',
+}
+assert.equal(await tabMenu.resolvePath(absoluteTab), '/home/nope/x.md')
+await tabMenu.reveal(absoluteTab)
+assert.equal(remoteCalls.stat.length, statCount, 'an absolute address is not restat-ed')
+assert.deepEqual(remoteCalls.reveal.at(-1), { path: '/home/nope/x.md', action: 'reveal' })
+
+/* A Host refusal is announced, never thrown out of the click. */
+remoteState.reveal = () => ({ ok: false, error: { message: 'no desktop' } })
+const failingItem = revealEntry.component({ tab: fileTab, dismiss() {} })
+failingItem.props.onClick({ preventDefault() {}, stopPropagation() {} })
+await nextTick()
+remoteState.reveal = () => ({ ok: true, value: { opened: true } })
+
+/* A Linux Home keeps the entry even when the catalog omits its file-manager row. */
+openInAppApps = []
+await tabMenu.refreshFileManager()
+assert.equal(tabMenu.fileManager(), 'directory', 'the Home spelling identifies the family')
+assert.equal(tabMenu.fileManagerLabel(), '在文件管理器中显示')
+
+/* Without the catalog route the Home spelling still decides. */
+fetchMode = 'fail'
+await tabMenu.refreshFileManager()
+assert.equal(tabMenu.fileManager(), 'directory', 'the fallback reads the Host home')
+
+/* Nothing identifies the family and the Host cannot open paths: hide the entry. */
+remote.$host.home = ''
+remoteState.canOpen = false
+await tabMenu.refreshFileManager()
+assert.equal(tabMenu.fileManager(), undefined, 'an unidentifiable Host has no opener yet')
+assert.equal(revealEntry.component({ tab: fileTab, dismiss() {} }), null)
+remote.$host.home = '/home/harness'
+remoteState.canOpen = true
+fetchMode = 'ok'
+openInAppApps = ['finder']
+await tabMenu.refreshFileManager()
+assert.equal(tabMenu.fileManager(), 'finder')
+
+/* 「引用到对话」 keeps the composer insertion face when the Host supplies it. */
 const inserted = []
 const inputActions = {
   captureInsertion: () => ({ draftRev: 3 }),
@@ -609,19 +773,72 @@ const inputActions = {
 const item = menuEntry.component({
   tab: fileTab,
   inputActions,
-  sessionId: 'session-a',
-  dismiss: () => {
-    dismissed = true
-  },
+  dismiss: () => {},
 })
 assert.equal(item.type, 'button')
 item.props.onClick({ preventDefault() {}, stopPropagation() {} })
 assert.deepEqual(inserted, [['@coupon/coupon-exact.png ', { draftRev: 3 }]])
-assert.equal(dismissed, true, 'an acting menu item must dismiss the menu')
 assert.ok(
   chatReference.textOf({ id: 'term', kind: 'terminal', title: 'zsh' }, 'session-a').includes('侧边栏终端「zsh」'),
   'terminal references carry the tab title',
 )
+
+/* Insertion order: capture the caret, focus the editor, insert, then dismiss.
+   Focusing after the edit is what used to drop the caret at offset 0. */
+const order = []
+const fakeEditor = {
+  getClientRects: () => [{ width: 1, height: 1 }],
+  focus: () => order.push('focus'),
+}
+globalThis.document = {
+  querySelector: () => null,
+  querySelectorAll: (selector) => (String(selector).includes('contenteditable') ? [fakeEditor] : []),
+  createElement: () => ({
+    dataset: {},
+    style: {},
+    setAttribute() {},
+    appendChild() {},
+    remove() {},
+    textContent: '',
+  }),
+  head: { appendChild() {} },
+  body: { appendChild() {} },
+  execCommand: () => false,
+}
+const orderedActions = {
+  captureInsertion: () => {
+    order.push('capture')
+    return { draftRev: 1 }
+  },
+  insertText: () => {
+    order.push('insert')
+    return true
+  },
+}
+const orderedItem = menuEntry.component({
+  tab: fileTab,
+  inputActions: orderedActions,
+  dismiss: () => order.push('dismiss'),
+})
+orderedItem.props.onClick({ preventDefault() {}, stopPropagation() {} })
+assert.deepEqual(order, ['capture', 'focus', 'insert', 'dismiss'], 'the caret is captured before the menu closes and the editor is focused before the edit')
+delete globalThis.document
+
+/* Without that face it copies the reference and says so, instead of vanishing. */
+clipboardWrites.length = 0
+const clipboardItem = menuEntry.component({ tab: fileTab, dismiss() {} })
+assert.notEqual(clipboardItem, null, 'a file tab references itself even without inputActions')
+clipboardItem.props.onClick({ preventDefault() {}, stopPropagation() {} })
+await nextTick()
+assert.deepEqual(clipboardWrites, ['@coupon/coupon-exact.png '])
+
+/* A browser tab without a supplied session uses the sidebar's on-screen session. */
+sidebarRightState.mounted = 'session-b'
+const browserItem = menuEntry.component({ tab: { id: 'tabB', kind: 'browser' }, dismiss() {} })
+browserItem.props.onClick({ preventDefault() {}, stopPropagation() {} })
+await nextTick()
+assert.deepEqual(clipboardWrites.at(-1), 'http://localhost:9000/#/\n')
+sidebarRightState.mounted = 'session-a'
 
 /* ------------------------------------------------------------------ */
 /* 12. Sidebar scope preference                                        */

@@ -66,10 +66,38 @@ dsh plugin --profile <profile> add dsh-sidebar-share
 | 终端 | 终端**当前可见屏幕**的最后 60 行，包在 ` ```text ` 代码块里 |
 
 - 插入走 DSH 的公开输入面（`inputActions.captureInsertion()` + `insertText()`），是一次可撤销的纯文本编辑，**不会覆盖**已有草稿。
-- 插入后焦点回到输入框，你接着写「把这个页面改成……」即可。
-- 如果当前窗口没有可用的编辑器（例如草稿由别的窗口持有），会退化为复制到剪贴板，并在 console 里说明。
+- 插入后焦点回到输入框，**光标停在刚插入的内容之后**，你接着写「把这个页面改成……」即可（不会跳到开头）。
+- 如果宿主没有提供插入面（`inputActions` 未挂载），会退化为复制到剪贴板，并在页面顶部弹出提示，不会出现“点了没反应”。
 - 终端只能读到**可见屏幕**（xterm 的 DOM 渲染器，不含滚动历史）；后台终端 tab 读到的是当时可见的那个终端，请以实际插入内容为准。
-- 宿主没有 `sidebar.right.tab.menu.item` 插槽或没有 `inputActions` 时，这一项不出现，不影响原有的镜像功能。
+- 宿主没有 `sidebar.right.tab.menu.item` 插槽时，这一项不出现，不影响原有的镜像功能。
+
+## 在访达 / 文件管理器中显示
+
+文件 tab（预览页、图片、文档等 `dsh-resource://file/...`）的**右键菜单**里多了一项：**「在访达中显示」**。Windows 上是 **「在文件资源管理器中显示」**，Linux 上是 **「在文件管理器中显示」**。
+
+- 动作由 Host 执行：插件先把 tab 的地址解析成 Host 上**已验证的绝对路径**（走了与会话文件预览同一套 `workspaceFiles.stat` 授权），再调用 `session.openWorkspacePath({ action: 'reveal' })`。macOS 是 `open -R`（访达里选中文件），Windows 是资源管理器选中，Linux 是 `xdg-open` 打开所在目录。
+- 平台判定以 Host 为准，不看浏览器：先读 Host 的 `open-in-app/apps` 目录（Finder / 资源管理器 / `filemanager`），读不到时再看 Host 的 home 目录拼写（`/Users/…`、`C:\Users\…`、`/home/…`）。所以在 macOS 上远程连 Linux 宿主，看到的是「在文件管理器中显示」，不会误标成访达。
+- 只有在**完全判断不出**宿主是哪个平台、且宿主也声明不能打开路径时，这一项才隐藏；其余情况即使 Host 没有桌面也会显示，点击失败时用顶部提示说明原因（例如远程 / 无显示服务器的宿主）。
+- 只对文件 tab 出现；浏览器、终端、文件树页签不会出现。
+- 失败不会静默：会弹一条「在访达中显示失败：…」的提示，说明是路径无法解析还是 Host 拒绝。
+
+### 调试
+
+DevTools console 里：
+
+```js
+window.__DSH_SIDEBAR_SHARE__.tabMenu.fileManager()      // 'finder' | 'explorer' | 'directory' | undefined
+window.__DSH_SIDEBAR_SHARE__.tabMenu.fileManagerLabel() // 当前菜单文案
+window.__DSH_SIDEBAR_SHARE__.tabMenu.resolvePath({ contentId: 'dsh-resource://file/session/<id>/AGENTS.md' })
+window.__DSH_SIDEBAR_SHARE__.tabMenu.reveal({ contentId: 'dsh-resource://file/absolute/Users/me/x.md' })
+window.__DSH_SIDEBAR_SHARE__.tabMenu.refreshFileManager()
+```
+
+## 升级到 0.1.6
+
+- 0.1.6 只改浏览器半：tab 右键菜单新增「在访达 / 文件资源管理器中 / 文件管理器中显示」，并让「引用到对话」在没有插入面时退化为复制到剪贴板 + 顶部提示。
+- 刷新窗口（Cmd+R / Ctrl+R）即可生效；不需要重启 Host，也不需要重开插件。
+- 菜单文案来自 Host 平台，换机器（macOS / Windows / Linux）会显示对应说法。
 
 ## 升级到 0.1.4
 
@@ -104,7 +132,8 @@ localStorage.setItem('dsh-sidebar-share.disabled', '1')
 
 ## 兼容性
 
-- 面向 DSH 0.2.1-rc.3 编写，依赖 `ctx.slots.resolveStore` 和 sidebar/browser store 的 `spec` 形状；「引用到对话」额外依赖 `sidebar.right.tab.menu.item` 插槽与 `inputActions` 输入面。
+- 面向 DSH 0.2.1-rc.3 编写，依赖 `ctx.slots.resolveStore` 和 sidebar/browser store 的 `spec` 形状；tab 右键菜单两项额外依赖 `sidebar.right.tab.menu.item` 插槽，`inputActions` 输入面（可缺省）以及 `remote.session.openWorkspacePath` / `remote.workspaceFiles.stat`。
+- 「在访达中显示」的平台判定优先读 Host 的 `open-in-app/apps`（`@deepseek-ai/dsh-host-open-in-app`）；该路由不可用时退化为 home 目录拼写判断。
 - 侧边栏范围设置依赖 Host 的 `settings` / `configForms`（ui-settings）与 schemastery。
 - 这些不是公开 API；DSH 升级后可能需要改插件。升级前建议先禁用插件确认侧栏行为。
 

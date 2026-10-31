@@ -152,3 +152,51 @@ harness 覆盖：v1 → v2 迁移、reset 清空并收起、首个 tab 解除 re
   `snapshot.value?.key`，不用 `.get()`。
 - 自检：`Config({}) === {scope:'workspace'}`、`Config({scope:'session'}) === {scope:'session'}`、
   `Config({scope:'bogus'})` 抛错。`node test/harness.mjs` 仍 ok。
+
+## 0.1.6：tab 右键菜单加「在访达 / 文件管理器 / 资源管理器中显示」（2026-10-31）
+
+### 需求
+
+侧边栏 tab 的右键菜单里要能「把文件在访达中打开」，Windows 上则是文件资源管理器。菜单槽位就是既有的 `sidebar.right.tab.menu.item`。
+
+### 实现
+
+- 新条目 `sidebar-share:reveal-in-file-manager`（order 90，排在「引用到对话」100 之前），只对 `dsh-resource://file/...` 的 tab 渲染。
+- 路径解析：先 `parseFileAddress()`（支持 `session/<id>/<相对路径>`、`session/<id>//<绝对路径>`、`absolute/<路径>`、Windows 盘符与 UNC），绝对路径直接用；否则 `remote.workspaceFiles.stat(sessionId, path)` 拿 Host 校验过的 `absolutePath`——与文档预览「显示文件位置」同一条链路。
+- 打开：`remote.session.openWorkspacePath({ path, action: 'reveal' })`。macOS `open -R`、Windows 资源管理器选中、Linux `xdg-open` 打开所在目录，都在 Host 侧。
+- 平台文案：优先读 Host 的 `open-in-app/apps`（`finder` / `explorer` / `filemanager`），失败时按 Host home 拼写判断（`/Users/`→访达，`C:\`/`\\`→资源管理器，`/home/`、`/root`→文件管理器）。**不看浏览器 UA**：远程连 Linux 宿主时应显示「在文件管理器中显示」。
+- 未知时才隐藏：判断不出平台且 `canOpenWorkspacePath()` 为 false 才不渲染；否则渲染，失败用顶部 toast 说明原因。
+- probe 时机：`ctx.inject(['remote'])` 后再探，未知答案按 400ms/800ms… 重试 5 次（`$host.home` 要等第一条 generation 才有值）。首版在 apply 里立刻探，探到 `undefined` 后不重试，菜单里就永远看不到这一项（真机复现过）。
+- toast：复用 DSH 的 toast 位置（`top:40px` 居中、`z-index:1100`、`role=alert`、`--dsw-alias-toast-*` 配色）。
+- 「引用到对话」一并修：宿主实际会传 `inputActions`（session props face），真机验证插入 `@路径` 成功；没有时改为复制到剪贴板 + 顶部提示（异步 `clipboard.writeText`，失败再退回 `execCommand('copy')`），不再静默。
+- 菜单样式对齐 dockkit 原生项：28px 高、8px 内边距、`--dsw-radius-md`、hover 用 `--dsw-alias-interactive-bg-hover`、14px 线性图标。
+
+### 验证
+
+- `node test/harness.mjs`：新增地址解析（相对 / session 绝对 / absolute / drive / UNC）、三平台文案、点击后 `stat` + `openWorkspacePath({action:'reveal'})`、绝对地址不 stat、Host 拒绝不抛、探测失败回退 home、识别不出时隐藏、`inputActions` 缺失时走剪贴板、browser tab 用 `sidebarRight.mounted` 补 sessionId。
+- 真机（本项目所在的 web profile，Chrome headless + CDP 127.0.0.1:9223，token 来自 systemd journal）：
+  - 插件加载：`version 0.1.6`、两条 `menu registered` 日志；
+  - 文件 tab 右键菜单实际顺序：`关闭` → `在文件管理器中显示` → `引用到对话`；
+  - 点击「在文件管理器中显示」：`[sidebar-share] revealed /home/yxw/Project/erp-admin-demo-1/.env in directory`，Host 真的开了文件管理器；
+  - 把 `open-in-app/apps` 依次伪造成 `finder` / `explorer` / `filemanager` 再 `refreshFileManager()`，菜单文案分别变成「在访达中显示」「在文件资源管理器中显示」「在文件管理器中显示」；
+  - 点击「引用到对话」后输入框出现 `@.env `（`inputActions` 路径生效）；失败 toast 截图确认位置/配色。
+- 本机环境注意：`dsh-web.service` 的 env 里没有 `DISPLAY`/`WAYLAND_DISPLAY`，所以 `open-in-app/apps` 只有 `["cursor"]`（目录里的 `filemanager` 项要求显示服务器），但 `revealNativePath` 不看显示，`xdg-open` 走 D-Bus 仍然成功。这也是「平台判定不能只看 catalog 有没有 filemanager」的原因。
+
+### 兼容
+
+- 只改浏览器半，刷新窗口即可；`PLUGIN_VERSION` 与 `package.json` 都升到 0.1.6。
+
+### 补充：引用到对话的光标位置（同版本修复）
+
+- 现象：文件 tab 右键「引用到对话」后，`@路径` 插在了正确的光标位置，但输入框光标跳到**开头**。
+- 根因：旧实现先 `dismiss()` 再 `captureInsertion()` + `insertText()`，最后 `setTimeout(focusComposer, 0)`。菜单关掉后编辑器仍是失焦状态，插入完成后再 `element.focus()` 会把 DOM 光标落到编辑器开头（Lexical 的 selection 不参与这次 focus）。
+- 修法：`captureInsertion()` 先取失焦前残留的 Lexical selection；**先 `focusComposer()` 再 `insertText()`**（编辑框有焦点时 Lexical 会在 applyEdit 后把 caret 放到插入内容之后）；最后再 `dismiss()`。顺序固定为 capture → focus → insert → dismiss，harness 里用假 editor 断言了这个序列。
+- 真机复现/回归（CDP，当前会话）：输入 `AAA BBB`，caret 4 → 右键 .env tab → 引用到对话：修复前 `caret=0`，修复后 `caret=10`（`AAA @.env` 之后），文本 `AAA @.env BBB`。
+- `focusComposer()` 现在取**可见的** composer（多个 contenteditable 时取最后一个可见的），避免分屏/多会话时聚焦错编辑框。
+
+## 2026-10-31 17:01 发布结果（0.1.6）
+
+- `npm publish --access public` 返回 `+ dsh-sidebar-share@0.1.6`；`npm view dsh-sidebar-share dist-tags` → `{ "latest": "0.1.6" }`。
+- 从 registry 重新下载 tarball 校验：`dist/client.js` 含 `sidebar-share:reveal-in-file-manager`、`在访达中显示`、`在文件资源管理器中显示`，且插入顺序为 `captureInsertion()` → `focusComposer()` → `insertText()`；`PLUGIN_VERSION` 与 `package.json` 均为 `0.1.6`。
+- 发布走 `scripts/release.sh`（本机没有 macOS Keychain，退回 `~/.npmrc` 的 token，`npm whoami` = `curleaf`）。
+- 本机 web profile 是 `link:` 安装，刷新窗口即可用上 0.1.6；其它机器 `dsh plugin --profile web add dsh-sidebar-share`。
